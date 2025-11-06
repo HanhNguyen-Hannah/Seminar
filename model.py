@@ -1,5 +1,3 @@
-# model.py
-
 from mesa import Model
 from mesa.time import SimultaneousActivation
 from mesa.datacollection import DataCollector
@@ -8,22 +6,23 @@ import numpy as np
 import random
 from agents import BaseFirm
 
-
 class MultiTierModel(Model):
     """
     Multi-tier supply chain model with suppliers, plants, DCs, and retailers.
-    Supports a single fixed-step disruption, recovery, and KPI computation.
+    Supports disruption scenarios and KPI computation.
     """
 
-    def __init__(self, assumptions=None, seed=None, dual_sourcing=False, disruption_at_step=10):
+    def __init__(self, assumptions=None, seed=None, dual_sourcing=False,
+                 disruption_at_step=10, scenario="capacity_only"):
         super().__init__(seed=seed)
         self.schedule = SimultaneousActivation(self)
         self.G = nx.DiGraph()
         self.dual_sourcing = dual_sourcing
         self.time = 0
         self._seed = seed
+        self.scenario = scenario
 
-        # --- Assumptions ---
+        # --- Default assumptions ---
         if assumptions is None:
             assumptions = {}
 
@@ -41,11 +40,13 @@ class MultiTierModel(Model):
         self.lead_time = assumptions.get(
             "lead_time", {"supplier": 2, "plant": 5, "dc": 5, "retailer": 2}
         )
-
         self.capacity_loss_frac = assumptions.get("capacity_loss_frac", 0.5)
         self.recovery_duration = assumptions.get("recovery_duration", 5)
+        self.holding_cost = assumptions.get("holding_cost", 1)
+        self.backlog_cost = assumptions.get("backlog_cost", 5)
+        self.retailer_demand_mean = assumptions.get("retailer_demand_mean", 5)
 
-        # --- Disruption config ---
+        # --- Disruption tracking ---
         self.disruption_at_step = disruption_at_step
         self.disruption_occurred = False
         self.disruption_step = None
@@ -55,7 +56,6 @@ class MultiTierModel(Model):
         # --- Create agents ---
         self.agents = []
         uid = 0
-
         self.suppliers = self._create_agents("supplier", self.n_suppliers, uid)
         uid += self.n_suppliers
         self.plants = self._create_agents("plant", self.n_plants, uid)
@@ -73,7 +73,6 @@ class MultiTierModel(Model):
                 "time": lambda m: m.time,
                 "fill_rate": lambda m: m.compute_fill_rate(),
                 "total_cost": lambda m: m.compute_total_cost(),
-                "bullwhip": lambda m: m.compute_bullwhip(),
             },
             agent_reporters={
                 "inventory": "inventory",
@@ -96,6 +95,8 @@ class MultiTierModel(Model):
                 base_stock=self.base_stock[tier],
                 capacity=self.capacity[tier],
                 lead_time=self.lead_time[tier],
+                holding_cost_per_unit=self.holding_cost,
+                backlog_cost_per_unit=self.backlog_cost
             )
             self.schedule.add(a)
             self.G.add_node(a.unique_id, agent=a)
@@ -137,23 +138,29 @@ class MultiTierModel(Model):
             if shipped > 0:
                 supplier_agent.inventory -= shipped
                 buyer.receive_shipment(shipped, supplier_agent.lead_time)
-            else:
-                supplier_agent.backlog += per_supplier
+            # Correct backlog
+            supplier_agent.backlog += (per_supplier - shipped)
 
     # -----------------------------
-    # Disruption
+    # Disruption scenarios
     # -----------------------------
     def step_disruption(self):
         if not self.disruption_occurred and self.time == self.disruption_at_step:
             self.fill_rate_before_disruption = self.compute_fill_rate()
             candidates = [a for a in self.agents if a.tier in ("supplier", "plant")]
             victim = self.random.choice(candidates)
-            victim.available_capacity = max(0, int(victim.capacity * (1 - self.capacity_loss_frac)))
+
+            if self.scenario == "capacity_only":
+                victim.available_capacity = max(0, int(victim.capacity * (1 - self.capacity_loss_frac)))
+            elif self.scenario == "lead_time_surge":
+                victim.lead_time += 2  ## CAN CHANGE LEADTIME
+            elif self.scenario == "demand_spike":
+                self.retailer_demand_mean *= 2  ## CAN CHANGE DEMAND SPIKE
+
             victim.recovery_timer = self.recovery_duration
-            victim.lead_time += 1
             self.disruption_occurred = True
             self.disruption_step = self.time
-            print(f"Disruption at step {self.time} | Victim: {victim}")
+            print(f"Disruption at step {self.time} | Scenario: {self.scenario} | Victim: {victim}")
 
     # -----------------------------
     # Step
@@ -183,20 +190,21 @@ class MultiTierModel(Model):
         return sum(a.holding_cost + a.backlog_cost for a in self.agents)
 
     def compute_bullwhip(self):
-        retailer_orders = [r.order_history for r in self.retailers]
-        retailer_flat = [x for h in retailer_orders for x in h]
-        upstream_orders = [x for a in self.agents if a.tier in ("supplier","plant") for x in a.order_history]
-        if len(retailer_flat) < 5 or len(upstream_orders) < 5:
+        """Compute bullwhip once after simulation."""
+        retailer_flat = [x for r in self.retailers for x in r.order_history]
+        upstream_flat = [x for a in self.agents if a.tier in ("supplier","plant") for x in a.order_history]
+        if len(retailer_flat) < 2 or np.var(retailer_flat) == 0:
             return np.nan
-        return np.var(upstream_orders) / np.var(retailer_flat) if np.var(retailer_flat)>0 else np.nan
+        return np.var(upstream_flat) / np.var(retailer_flat)
 
     def compute_time_to_recover(self):
         if self.disruption_step is None:
             return np.nan
         baseline_fill_rate = getattr(self, "fill_rate_before_disruption", 0.9)
         df = self.datacollector.get_model_vars_dataframe()
-        for step in range(self.disruption_step, len(df)):
-            if df.loc[step, "fill_rate"] >= baseline_fill_rate:
-                self.recovery_step = step
-                return step - self.disruption_step + 1
+        recovery_steps = df.index[df["fill_rate"] >= baseline_fill_rate]
+        recovery_steps = [s for s in recovery_steps if s >= self.disruption_step]
+        if recovery_steps:
+            self.recovery_step = recovery_steps[0]
+            return self.recovery_step - self.disruption_step + 1
         return np.nan

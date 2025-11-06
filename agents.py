@@ -1,14 +1,16 @@
 from mesa import Agent
 import numpy as np
 
-
 class BaseFirm(Agent):
     """
     Agent representing a firm in a multi-tier supply chain.
     Can act as Supplier, Plant, DC, or Retailer.
     """
 
-    def __init__(self, unique_id, model, tier, base_stock=50, capacity=10, lead_time=1):
+    def __init__(
+        self, unique_id, model, tier, base_stock=50, capacity=10, lead_time=1,
+        holding_cost_per_unit=1, backlog_cost_per_unit=5
+    ):
         super().__init__(unique_id, model)
         self.tier = tier
 
@@ -31,6 +33,10 @@ class BaseFirm(Agent):
         self.order_history = []
         self.recovery_steps = []
 
+        # --- Cost params ---
+        self.holding_cost_per_unit = holding_cost_per_unit
+        self.backlog_cost_per_unit = backlog_cost_per_unit
+
         # --- Random generator ---
         if hasattr(self.model, "_seed") and self.model._seed is not None:
             self.np_random = np.random.default_rng(self.model._seed + unique_id)
@@ -46,18 +52,18 @@ class BaseFirm(Agent):
         Retailer generates demand and computes orders based on base-stock policy.
         Other tiers just compute base-stock replenishment.
         """
+        # --- Retailer demand ---
         if self.tier == "retailer":
-            demand = self.np_random.poisson(5)
+            demand = self.np_random.poisson(self.model.retailer_demand_mean)
             self.total_demand += demand
 
-            # Fulfill as much demand as possible
             fulfilled = min(self.inventory, demand)
             self.inventory -= fulfilled
             unmet = demand - fulfilled
             self.backlog += unmet
             self.fulfilled_demand += fulfilled
 
-        # Base-stock policy
+        # --- Base-stock replenishment for all tiers ---
         net_inventory = self.inventory + self.on_order - self.backlog
         order_qty = max(0, self.base_stock - net_inventory)
 
@@ -66,7 +72,7 @@ class BaseFirm(Agent):
         self.on_order += order_qty
         self.model.place_order(self, order_qty)
 
-        return order_qty  # optional, useful for logging
+        return order_qty
 
     def step_receive(self):
         """
@@ -89,10 +95,8 @@ class BaseFirm(Agent):
             self.on_order = max(0, self.on_order - arrived)
 
         # --- Compute costs ---
-        h = 1  # holding cost per unit
-        p = 5  # backlog cost per unit
-        self.holding_cost += max(self.inventory, 0) * h
-        self.backlog_cost += max(self.backlog, 0) * p
+        self.holding_cost += max(self.inventory, 0) * self.holding_cost_per_unit
+        self.backlog_cost += max(self.backlog, 0) * self.backlog_cost_per_unit
 
     def step_produce(self):
         """
@@ -100,9 +104,9 @@ class BaseFirm(Agent):
         Limited by available_capacity.
         """
         if self.tier in ("supplier", "plant") and self.available_capacity > 0:
-            # Produce up to available capacity
             produced = min(self.capacity, self.available_capacity)
             self.inventory += produced
+            self.available_capacity -= produced  # <-- giảm capacity
 
     def step_recover(self):
         """
@@ -113,7 +117,6 @@ class BaseFirm(Agent):
             self.recovery_timer -= 1
             if self.recovery_timer == 0:
                 self.available_capacity = self.capacity
-                # log recovery step for later analysis
                 self.recovery_steps.append(self.model.time)
 
     # ---------------------------------------------------------------------
@@ -124,6 +127,8 @@ class BaseFirm(Agent):
         """
         Add incoming shipment to in_transit list.
         """
+        if qty <= 0:
+            return
         if lead_time is None:
             lead_time = self.lead_time
         self.in_transit.append((qty, lead_time))
