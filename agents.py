@@ -34,6 +34,14 @@ class BaseFirm(Agent):
         self.backlog_cost = 0.0
         self.backlog_history = []  # 1 if backlog>0 at step, else 0
 
+        self.history = {
+        "inventory": [],
+        "backlog": [],
+        "orders_placed": [],
+        "orders_received": [],
+        "production": [],}
+
+
         # Disruption / recovery
         self.recovery_timer = 0
         self.recovery_ramp_fraction = 1.0
@@ -86,6 +94,10 @@ class BaseFirm(Agent):
         net_inv = self.inventory + pipeline - self.backlog
         order_qty = max(0, int(self.base_stock - net_inv))
         self.order_history.append(order_qty)
+
+        # after order_qty computed
+        self.history["orders_placed"].append(order_qty)
+
         return order_qty
 
     def step_receive(self):
@@ -121,11 +133,16 @@ class BaseFirm(Agent):
         # record backlog presence
         self.backlog_history.append(1 if self.backlog > 0 else 0)
 
+        # after receive arrivals
+        self.history["orders_received"].append(arrived if arrived > 0 else 0)
+
+
     def step_produce(self):
         """
         Produce up to available_capacity, but target production to reach base_stock.
         This prevents unbounded overproduction.
         """
+        produce_qty = 0
         if self.tier in ("supplier", "plant") and self.available_capacity > 0:
             # compute desired production to move inventory towards base_stock (consider pipeline and backlog)
             pipeline = sum(e["qty"] for e in self.in_transit)
@@ -136,6 +153,10 @@ class BaseFirm(Agent):
                 self.inventory += produce_qty
                 # consume available_capacity for this step
                 self.available_capacity -= produce_qty
+
+            # after produce
+            self.history["production"].append(produce_qty)
+
 
     def step_recover(self):
         """
@@ -168,3 +189,13 @@ class BaseFirm(Agent):
     def __repr__(self):
         pipeline = sum(e["qty"] for e in self.in_transit)
         return f"<Firm {self.unique_id} {self.tier} Inv:{self.inventory} Bk:{self.backlog} Pipe:{pipeline}>"
+
+    def get_state_summary(self):
+        return {
+        "inventory": self.inventory,
+        "backlog": self.backlog,
+        "pipeline": sum(e["qty"] for e in self.in_transit),
+        "last_order": self.order_history[-1] if self.order_history else 0,
+        "last_received": self.history["orders_received"][-1] if self.history["orders_received"] else 0,
+        "last_production": self.history["production"][-1] if self.history["production"] else 0
+        }

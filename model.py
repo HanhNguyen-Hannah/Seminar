@@ -152,46 +152,38 @@ class MultiTierModel(Model):
     # -----------------------------
     def step(self):
         # 0) reset agent step state
-
         for a in self.agents:
             a.reset_step_state()
 
-        t = self.time
-        if t == self.disruption_step:
-            df = self.datacollector.get_model_vars_dataframe()
-            self.fill_rate_baseline = df["fill_rate"].iloc[0:self.disruption_step].mean()
-            self.disruption_done = True
-
-        # 1) trigger disruption
+        # 1) trigger disruption (may set self.disruption_step and baseline)
         self._maybe_trigger_disruption()
 
-        # 2) collect 
-        self.schedule.steps = self.time
-        self.datacollector.collect(self)
-
-        # 3) ordering decisions
+        # 2) ordering decisions
         buyer_orders = {}
         for a in self.agents:
             q = a.step_order()
             buyer_orders[a.unique_id] = q
 
-        # 4) process orders and allocate shipments
+        # 3) process orders and allocate shipments
         self._process_orders_and_allocate(buyer_orders)
 
-        # 5) receive shipments và update cost
+        # 4) receive shipments và update cost
         for a in self.agents:
             a.step_receive()
 
-        # 6) production
+        # 5) production
         for a in self.agents:
             a.step_produce()
 
-        # 7) recovery countdown
+        # 6) recovery countdown
         for a in self.agents:
             a.step_recover()
 
-        self.time += 1
+        # 7) collect model-level metrics AT END OF STEP (so datacollector records end-of-step KPIs)
+        self.schedule.steps = self.time
+        self.datacollector.collect(self)
 
+        self.time += 1
 
     # -----------------------------
     # Disruption handling
@@ -204,25 +196,41 @@ class MultiTierModel(Model):
                 return
             victim = random.choice(candidates)
             self._victim = victim
-            self.fill_rate_before_disruption = self.compute_fill_rate()
+
+            # compute baseline fill_rate using collected data up to now (steps before disruption)
+            try:
+                df = self.datacollector.get_model_vars_dataframe()
+                # df indexed by collection order; consider only steps strictly before current time
+                if "fill_rate" in df.columns and len(df) > 0:
+                    # use dropna to avoid NaN skewing baseline
+                    pre_df = df["fill_rate"].iloc[0:self.time].dropna()
+                    if len(pre_df) > 0:
+                        self.fill_rate_baseline = float(pre_df.mean())
+                    else:
+                        self.fill_rate_baseline = np.nan
+                else:
+                    self.fill_rate_baseline = np.nan
+            except Exception:
+                self.fill_rate_baseline = np.nan
+
             # apply scenario
             if self.scenario == "capacity_loss":
                 # reduce capacity via ramp fraction
                 victim.recovery_ramp_fraction = max(0.0, 1.0 - self.capacity_loss_frac)
-                # set available capacity now accordingly
                 victim.available_capacity = int(victim.capacity * victim.recovery_ramp_fraction)
                 victim.recovery_timer = self.recovery_duration
             elif self.scenario == "lead_time_surge":
-                victim.lead_time += 1
+                victim.lead_time += 3
                 victim.recovery_timer = self.recovery_duration
             elif self.scenario == "demand_spike":
-                self.retailer_demand_mean = self._retailer_demand_baseline * 4.0
-                # model uses victim.recovery_timer as a system-level recovery window
+                self.retailer_demand_mean = self._retailer_demand_baseline * 2.0
                 victim.recovery_timer = self.recovery_duration
+
             self.disruption_done = True
             self.disruption_step = self.time
-            # print small log
-            print(f"[Disruption] t={self.time} scenario={self.scenario} victim={victim}")
+
+            print(f"[Disruption] t={self.time} scenario={self.scenario} victim={victim} baseline_fill={self.fill_rate_baseline}")
+
 
     def _agent_recovered(self, agent):
         """
@@ -363,21 +371,86 @@ class MultiTierModel(Model):
 
     def compute_time_to_recover(self, target_frac=0.95):
         """
-        TTR = steps until fill_rate >= target_frac * fill_rate avg in first 10 steps.
+        TTR = steps until fill_rate >= target_frac * fill_rate_baseline.
+        Return nan if baseline missing, no disruption, or no valid data.
         """
+        # Preconditions
         if not self.disruption_done or self.disruption_step is None:
             return np.nan
 
         baseline = getattr(self, "fill_rate_baseline", None)
-        if baseline is None or np.isnan(baseline):
+        if baseline is None or (isinstance(baseline, float) and np.isnan(baseline)):
             return np.nan
 
+        # get dataframe and ensure fill_rate column exists
         df = self.datacollector.get_model_vars_dataframe()
+        if "fill_rate" not in df.columns or df.empty:
+            return np.nan
+
+        # consider only entries from disruption_step onward, drop NaNs
+        try:
+            eligible = df.loc[df.index >= self.disruption_step, "fill_rate"].dropna()
+        except Exception:
+            # defensive fallback
+            eligible = df["fill_rate"].dropna()
+            eligible = eligible.loc[eligible.index >= self.disruption_step] if not eligible.empty else eligible
+
+        if eligible.empty:
+            return np.nan
+
         target = target_frac * baseline
 
-        recovery_steps = df.index[(df["fill_rate"] >= target) & (df.index >= self.disruption_step)].tolist()
-        if recovery_steps:
-            return int(recovery_steps[0] - self.disruption_step + 1)
+        # find first index (time step) where value >= target
+        for idx, val in eligible.items():
+            # idx is the DataFrame index: should correspond to step number
+            if val >= target:
+                # return number of steps from disruption (inclusive)
+                return int(idx - self.disruption_step + 1)
+
+        # not recovered within available data
         return np.nan
 
+    # =============================
+    # DIAGNOSTIC HELPERS
+    # =============================
+
+    def get_total_inventory(self):
+        """Return total inventory across all firms."""
+        return sum(agent.inventory for agent in self.schedule.agents)
+
+    def get_total_pipeline(self):
+        """Total units currently in transit."""
+        return sum(sum(e["qty"] for e in agent.in_transit) for agent in self.schedule.agents)
+
+    def get_total_backlog(self):
+        """Total unfulfilled demand across all nodes."""
+        return sum(agent.backlog for agent in self.schedule.agents)
+
+    def get_orders_by_tier(self):
+        """
+        Return total inbound order quantities per tier.
+        Useful for bullwhip visualization.
+        """
+        tiers = {"supplier": 0, "plant": 0, "dc": 0, "retailer": 0}
+
+        for agent in self.schedule.agents:
+            if agent.order_history:
+                last_order = agent.order_history[-1]
+                tiers[agent.tier] += last_order
+
+        return tiers
+
+    def get_production_by_tier(self):
+        """
+        Track actual production (or shipments) by tier.
+        Requires each agent to store last_production in step().
+        """
+        tiers = {"supplier": 0, "plant": 0, "dc": 0, "retailer": 0}
+
+        for agent in self.schedule.agents:
+            if agent.history["production"]:
+                last_production = agent.history["production"][-1]
+                tiers[agent.tier] += last_production
+
+        return tiers
 
