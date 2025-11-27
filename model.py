@@ -121,6 +121,8 @@ class MultiTierModel(Model):
                 # example: +25% capacity
                 a.capacity = max(1, int(a.capacity * 1.25))
                 a._orig_capacity = a.capacity
+            a._orig_capacity = a.capacity
+            a._orig_lead_time = a.lead_time   
             self.G.add_node(a.unique_id, agent=a)
             created.append(a)
             self.agents.append(a)
@@ -150,42 +152,46 @@ class MultiTierModel(Model):
     # -----------------------------
     def step(self):
         # 0) reset agent step state
+
         for a in self.agents:
             a.reset_step_state()
 
-        # 1) trigger disruption if scheduled (one-time)
+        t = self.time
+        if t == self.disruption_step:
+            df = self.datacollector.get_model_vars_dataframe()
+            self.fill_rate_baseline = df["fill_rate"].iloc[0:self.disruption_step].mean()
+            self.disruption_done = True
+
+        # 1) trigger disruption
         self._maybe_trigger_disruption()
 
-        # 2) ordering decisions
+        # 2) collect 
+        self.schedule.steps = self.time
+        self.datacollector.collect(self)
+
+        # 3) ordering decisions
         buyer_orders = {}
         for a in self.agents:
             q = a.step_order()
             buyer_orders[a.unique_id] = q
 
-        # 3) process orders and allocate shipments
+        # 4) process orders and allocate shipments
         self._process_orders_and_allocate(buyer_orders)
 
-        # 4) receive shipments and update costs
+        # 5) receive shipments và update cost
         for a in self.agents:
             a.step_receive()
 
-        # 5) production
+        # 6) production
         for a in self.agents:
             a.step_produce()
 
-        # 6) recovery countdown
+        # 7) recovery countdown
         for a in self.agents:
             a.step_recover()
 
-        # 7) post-disruption housekeeping (restore demand baseline if needed)
-        if self.disruption_done and self.scenario == "demand_spike":
-            if all(a.recovery_timer == 0 for a in self.agents):
-                self.retailer_demand_mean = self._retailer_demand_baseline
-
-        # 8) collect data
-        self.schedule.steps = self.time
-        self.datacollector.collect(self)
         self.time += 1
+
 
     # -----------------------------
     # Disruption handling
@@ -207,10 +213,10 @@ class MultiTierModel(Model):
                 victim.available_capacity = int(victim.capacity * victim.recovery_ramp_fraction)
                 victim.recovery_timer = self.recovery_duration
             elif self.scenario == "lead_time_surge":
-                victim.lead_time += 2
+                victim.lead_time += 1
                 victim.recovery_timer = self.recovery_duration
             elif self.scenario == "demand_spike":
-                self.retailer_demand_mean = self._retailer_demand_baseline * 2.0
+                self.retailer_demand_mean = self._retailer_demand_baseline * 4.0
                 # model uses victim.recovery_timer as a system-level recovery window
                 victim.recovery_timer = self.recovery_duration
             self.disruption_done = True
@@ -223,10 +229,15 @@ class MultiTierModel(Model):
         Called when an agent finishes recovery (its recovery_timer reached zero).
         Revert any temporary modifications (lead_time).
         """
-        if self.scenario == "lead_time_surge" and self._victim is not None:
-            if agent.unique_id == self._victim.unique_id:
-                agent.lead_time = agent._orig_lead_time
-                self.recovery_step = self.time
+        if self._victim is None or agent.unique_id != self._victim.unique_id:
+            return
+        if self._victim is not None and self._victim.recovery_timer == 0:
+         # reset demand baseline
+            if self.scenario == "demand_spike":
+                self.retailer_demand_mean = self._retailer_demand_baseline
+            agent.lead_time = agent._orig_lead_time
+            agent.available_capacity = agent._orig_capacity
+        self.recovery_step = self.time
 
     # -----------------------------
     # Orders processing and allocation
@@ -350,21 +361,23 @@ class MultiTierModel(Model):
         durations = [sum(r.backlog_history) for r in self.retailers]
         return float(np.mean(durations)) if durations else np.nan
 
-    def compute_time_to_recover(self):
+    def compute_time_to_recover(self, target_frac=0.95):
         """
-        Find first step >= disruption_step where fill_rate >= baseline_fill_rate (captured before disruption).
-        Returns steps to recover (inclusive).
+        TTR = steps until fill_rate >= target_frac * fill_rate avg in first 10 steps.
         """
         if not self.disruption_done or self.disruption_step is None:
             return np.nan
-        baseline = self.fill_rate_before_disruption
-        df = self.datacollector.get_model_vars_dataframe()
-        # ensure baseline is not nan
-        if np.isnan(baseline):
+
+        baseline = getattr(self, "fill_rate_baseline", None)
+        if baseline is None or np.isnan(baseline):
             return np.nan
-        # df.index corresponds to step numbers starting at 0
-        recovery_steps = df.index[df["fill_rate"] >= baseline].tolist()
-        recovery_steps = [s for s in recovery_steps if s >= self.disruption_step]
+
+        df = self.datacollector.get_model_vars_dataframe()
+        target = target_frac * baseline
+
+        recovery_steps = df.index[(df["fill_rate"] >= target) & (df.index >= self.disruption_step)].tolist()
         if recovery_steps:
             return int(recovery_steps[0] - self.disruption_step + 1)
         return np.nan
+
+
