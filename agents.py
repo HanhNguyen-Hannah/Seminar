@@ -11,7 +11,7 @@ class BaseFirm(Agent):
     def __init__(self, unique_id, model, tier,
                  base_stock=50, capacity=10, lead_time=1,
                  holding_cost_per_unit=1.0, backlog_cost_per_unit=5.0):
-        super().__init__(unique_id, model)
+        super().__init__(model)
         self.unique_id = unique_id
         self.tier = tier
 

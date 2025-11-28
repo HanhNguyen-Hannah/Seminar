@@ -9,7 +9,7 @@ from agents import BaseFirm
 class DummySchedule:
     """Small schedule to satisfy DataCollector (agents list and step counter)."""
     def __init__(self):
-        self.all_agents = []
+        self.agents = []
         self.steps = 0
 
 class MultiTierModel(Model):
@@ -71,7 +71,7 @@ class MultiTierModel(Model):
 
         # agents & network
         self.G = nx.DiGraph()
-        self.all_agents = []
+        self.agents = []
         self.suppliers, self.plants, self.dcs, self.retailers = [], [], [], []
 
         # apply safety stock factor
@@ -125,8 +125,8 @@ class MultiTierModel(Model):
             a._orig_lead_time = a.lead_time   
             self.G.add_node(a.unique_id, agent=a)
             created.append(a)
-            self.all_agents.append(a)
-            self.schedule.all_agents.append(a)
+            self.agents.append(a)
+            self.schedule.agents.append(a)
         return created
 
     def _build_network(self):
@@ -153,7 +153,7 @@ class MultiTierModel(Model):
     def step(self):
         # 0) reset agent step state
 
-        for a in self.all_agents:
+        for a in self.agents:
             a.reset_step_state()
 
         t = self.time
@@ -171,7 +171,7 @@ class MultiTierModel(Model):
 
         # 3) ordering decisions
         buyer_orders = {}
-        for a in self.all_agents:
+        for a in self.agents:
             q = a.step_order()
             buyer_orders[a.unique_id] = q
 
@@ -179,15 +179,15 @@ class MultiTierModel(Model):
         self._process_orders_and_allocate(buyer_orders)
 
         # 5) receive shipments và update cost
-        for a in self.all_agents:
+        for a in self.agents:
             a.step_receive()
 
         # 6) production
-        for a in self.all_agents:
+        for a in self.agents:
             a.step_produce()
 
         # 7) recovery countdown
-        for a in self.all_agents:
+        for a in self.agents:
             a.step_recover()
 
         self.time += 1
@@ -199,7 +199,7 @@ class MultiTierModel(Model):
     def _maybe_trigger_disruption(self):
         if (not self.disruption_done) and (self.time == self.disruption_at_step):
             # choose victim among suppliers and plants
-            candidates = [a for a in self.all_agents if a.tier in ("supplier", "plant")]
+            candidates = [a for a in self.agents if a.tier in ("supplier", "plant")]
             if not candidates:
                 return
             victim = random.choice(candidates)
@@ -249,7 +249,7 @@ class MultiTierModel(Model):
         3) Suppliers allocate according to SRF (dynamic_reallocation) or proportional.
         """
         # prepare request buckets for all agent ids (safe)
-        request_buckets = {a.unique_id: [] for a in self.all_agents}
+        request_buckets = {a.unique_id: [] for a in self.agents}
 
         # map buyer orders to upstream nodes
         for buyer_uid, qty in buyer_orders.items():
@@ -331,7 +331,7 @@ class MultiTierModel(Model):
 
     def _agent_by_uid(self, uid):
         # small network: linear search OK; can optimize with dict if needed
-        for a in self.all_agents:
+        for a in self.agents:
             if a.unique_id == uid:
                 return a
         return None
@@ -345,11 +345,11 @@ class MultiTierModel(Model):
         return total_fulfilled / total_demand if total_demand > 0 else np.nan
 
     def compute_total_cost(self):
-        return sum(a.holding_cost + a.backlog_cost for a in self.all_agents)
+        return sum(a.holding_cost + a.backlog_cost for a in self.agents)
 
     def compute_bullwhip(self):
         retailer_orders = [x for r in self.retailers for x in r.order_history]
-        upstream_orders = [x for a in self.all_agents if a.tier in ("supplier", "plant") for x in a.order_history]
+        upstream_orders = [x for a in self.agents if a.tier in ("supplier", "plant") for x in a.order_history]
         if len(retailer_orders) < 2 or np.var(retailer_orders) == 0:
             return np.nan
         return float(np.var(upstream_orders) / np.var(retailer_orders)) if np.var(retailer_orders) > 0 else np.nan
