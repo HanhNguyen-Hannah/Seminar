@@ -7,44 +7,43 @@ import random
 from agents import BaseFirm
 
 class DummySchedule:
-    """Small schedule to satisfy DataCollector (agents list and step counter)."""
+    """Small schedule to satisfy DataCollector."""
     def __init__(self):
         self.all_agents = []
         self.steps = 0
 
 class MultiTierModel(Model):
     """
-    Multi-tier supply chain ABM.
-    Default topology: 2 suppliers -> 1 plant -> 1 DC -> 3 retailers
-    Supports strategies: dual sourcing, safety stock (factor), flexible capacity, dynamic reallocation (SRF).
-    Single disruption per run at disruption_at_step.
+    Multi-tier supply chain ABM with disruption scenarios and resilience strategies.
+    
     """
 
     def __init__(self, assumptions=None, seed=None, strategies=None,
-                 disruption_at_step=10, scenario="capacity_loss"):
+                 disruption_at_step=10, scenario="capacity_loss", n_steps=100):
         super().__init__(seed=seed)
         self.schedule = DummySchedule()
         self._seed = seed
+        self.n_steps = n_steps  # Store for TTR calculation
         random.seed(seed)
         np.random.seed(seed)
 
-        # default configs
+        # Default configs
         assumptions = assumptions or {}
         strategies = strategies or {}
 
-        # network sizes
+        # Network sizes
         self.n_suppliers = assumptions.get("n_suppliers", 2)
         self.n_plants = assumptions.get("n_plants", 1)
         self.n_dcs = assumptions.get("n_dcs", 1)
         self.n_retailers = assumptions.get("n_retailers", 3)
 
-        # base params
+        # Base params
         self.base_stock = assumptions.get("base_stock",
-                                          {"supplier": 100, "plant": 80, "dc": 60, "retailer": 30})
+            {"supplier": 100, "plant": 80, "dc": 60, "retailer": 30})
         self.capacity = assumptions.get("capacity",
-                                        {"supplier": 20, "plant": 15, "dc": 10, "retailer": 0})
+            {"supplier": 20, "plant": 15, "dc": 10, "retailer": 0})
         self.lead_time = assumptions.get("lead_time",
-                                        {"supplier": 1, "plant": 5, "dc": 5, "retailer": 2})
+            {"supplier": 1, "plant": 5, "dc": 5, "retailer": 2})
         self.capacity_loss_frac = assumptions.get("capacity_loss_frac", 0.5)
         self.recovery_duration = assumptions.get("recovery_duration", 5)
         self.holding_cost = assumptions.get("holding_cost", 1.0)
@@ -52,40 +51,44 @@ class MultiTierModel(Model):
         self.retailer_demand_mean = assumptions.get("retailer_demand_mean", 5.0)
         self._retailer_demand_baseline = self.retailer_demand_mean
 
-        # strategies
+        # Strategies
         self.strategy_dual = strategies.get("dual_sourcing", False)
         self.safety_stock_factor = strategies.get("safety_stock_factor", 1.0)
         self.flexible_capacity = strategies.get("flexible_capacity", False)
         self.dynamic_reallocation = strategies.get("dynamic_reallocation", False)
-        self.dual_share = strategies.get("dual_share", (0.8, 0.2))  # primary/secondary
+        self.dual_share = strategies.get("dual_share", (0.8, 0.2))
 
-        # disruption config
+        # Disruption config
         self.disruption_at_step = disruption_at_step
-        self.scenario = scenario  # 'capacity_loss','lead_time_surge','demand_spike'
+        self.scenario = scenario
         self.time = 0
         self.disruption_done = False
         self.disruption_step = None
-        self.fill_rate_before_disruption = None
+        self.fill_rate_baseline = None
         self._victim = None
+        self.victim_history = []
         self.recovery_step = None
 
-        # agents & network
+        # Agents & network
         self.G = nx.DiGraph()
         self.all_agents = []
         self.suppliers, self.plants, self.dcs, self.retailers = [], [], [], []
 
-        # apply safety stock factor
+        # Apply safety stock factor
         for tier in self.base_stock:
             self.base_stock[tier] = int(self.base_stock[tier] * self.safety_stock_factor)
 
-        # create agents
+        # Create agents
         uid = 0
-        self.suppliers = self._create_agents("supplier", self.n_suppliers, uid); uid += self.n_suppliers
-        self.plants = self._create_agents("plant", self.n_plants, uid); uid += self.n_plants
-        self.dcs = self._create_agents("dc", self.n_dcs, uid); uid += self.n_dcs
-        self.retailers = self._create_agents("retailer", self.n_retailers, uid); uid += self.n_retailers
+        self.suppliers = self._create_agents("supplier", self.n_suppliers, uid)
+        uid += self.n_suppliers
+        self.plants = self._create_agents("plant", self.n_plants, uid)
+        uid += self.n_plants
+        self.dcs = self._create_agents("dc", self.n_dcs, uid)
+        uid += self.n_dcs
+        self.retailers = self._create_agents("retailer", self.n_retailers, uid)
 
-        # build network edges
+        # Build network
         self._build_network()
 
         # DataCollector
@@ -94,7 +97,11 @@ class MultiTierModel(Model):
                 "time": lambda m: m.time,
                 "fill_rate": lambda m: m.compute_fill_rate(),
                 "total_cost": lambda m: m.compute_total_cost(),
-                "bullwhip": lambda m: m.compute_bullwhip()
+                "bullwhip_total": lambda m: m.compute_bullwhip().get("total", np.nan),
+                "bullwhip_retailer": lambda m: m.compute_bullwhip().get("retailer", np.nan),
+                "bullwhip_dc": lambda m: m.compute_bullwhip().get("dc", np.nan),
+                "bullwhip_plant": lambda m: m.compute_bullwhip().get("plant", np.nan),
+                "bullwhip_supplier": lambda m: m.compute_bullwhip().get("supplier", np.nan),
             },
             agent_reporters={
                 "inventory": "inventory",
@@ -110,19 +117,22 @@ class MultiTierModel(Model):
     def _create_agents(self, tier, n, start_uid):
         created = []
         for i in range(n):
-            a = BaseFirm(unique_id=start_uid + i, model=self, tier=tier,
-                         base_stock=self.base_stock[tier],
-                         capacity=self.capacity[tier],
-                         lead_time=self.lead_time[tier],
-                         holding_cost_per_unit=self.holding_cost,
-                         backlog_cost_per_unit=self.backlog_cost)
-            # flexible capacity (increase nominal capacity)
+            a = BaseFirm(
+                unique_id=start_uid + i,
+                model=self,
+                tier=tier,
+                base_stock=self.base_stock[tier],
+                capacity=self.capacity[tier],
+                lead_time=self.lead_time[tier],
+                holding_cost_per_unit=self.holding_cost,
+                backlog_cost_per_unit=self.backlog_cost
+            )
+            
+            # Flexible capacity: increase nominal capacity
             if self.flexible_capacity and a.tier in ("supplier", "plant"):
-                # example: +25% capacity
-                a.capacity = max(1, int(a.capacity * 1.25))
+                a.capacity = max(1, int(a.capacity * 1.5))
                 a._orig_capacity = a.capacity
-            a._orig_capacity = a.capacity
-            a._orig_lead_time = a.lead_time   
+            
             self.G.add_node(a.unique_id, agent=a)
             created.append(a)
             self.all_agents.append(a)
@@ -130,160 +140,217 @@ class MultiTierModel(Model):
         return created
 
     def _build_network(self):
-        # Supplier -> Plant (allow up to 2 suppliers per plant if dual sourcing)
-        for plant in self.plants:
-            k = min(len(self.suppliers), 2 if self.strategy_dual else 1)
-            upstream = random.sample(self.suppliers, k=k)
-            for s in upstream:
+        """
+        Build deterministic network topology using round-robin assignment.
+        Ensures all suppliers are utilized.
+        """
+        # Supplier -> Plant
+        for i, plant in enumerate(self.plants):
+            if self.strategy_dual and len(self.suppliers) >= 2:
+                # Dual sourcing: assign 2 suppliers per plant
+                s1_idx = (i * 2) % len(self.suppliers)
+                s2_idx = (i * 2 + 1) % len(self.suppliers)
+                self.G.add_edge(self.suppliers[s1_idx].unique_id, plant.unique_id)
+                self.G.add_edge(self.suppliers[s2_idx].unique_id, plant.unique_id)
+            else:
+                # Single sourcing: round-robin
+                s = self.suppliers[i % len(self.suppliers)]
                 self.G.add_edge(s.unique_id, plant.unique_id)
+        
         # Plant -> DC
-        for dc in self.dcs:
-            upstream = random.sample(self.plants, k=1)
-            for p in upstream:
-                self.G.add_edge(p.unique_id, dc.unique_id)
+        for i, dc in enumerate(self.dcs):
+            p = self.plants[i % len(self.plants)]
+            self.G.add_edge(p.unique_id, dc.unique_id)
+        
         # DC -> Retailer
-        for r in self.retailers:
-            upstream = random.sample(self.dcs, k=1)
-            for d in upstream:
-                self.G.add_edge(d.unique_id, r.unique_id)
+        for i, r in enumerate(self.retailers):
+            dc = self.dcs[i % len(self.dcs)]
+            self.G.add_edge(dc.unique_id, r.unique_id)
 
     # -----------------------------
     # Step orchestration
     # -----------------------------
     def step(self):
-        # 0) reset agent step state
-
+        # 0) Reset agent step state
         for a in self.all_agents:
             a.reset_step_state()
 
-        t = self.time
-        if t == self.disruption_step:
+        # Calculate baseline BEFORE disruption
+        if self.time == self.disruption_at_step - 1:
             df = self.datacollector.get_model_vars_dataframe()
-            self.fill_rate_baseline = df["fill_rate"].iloc[0:self.disruption_step].mean()
-            self.disruption_done = True
+            if len(df) >= 5:
+                # Use last 5 steps as baseline
+                self.fill_rate_baseline = df["fill_rate"].iloc[-5:].mean()
+            else:
+                self.fill_rate_baseline = 0.95
 
-        # 1) trigger disruption
+        # 1) Trigger disruption
         self._maybe_trigger_disruption()
 
-        # 2) collect 
+        # 2) Collect data
         self.schedule.steps = self.time
         self.datacollector.collect(self)
 
-        # 3) ordering decisions
+        # 3) Ordering decisions
         buyer_orders = {}
         for a in self.all_agents:
             q = a.step_order()
             buyer_orders[a.unique_id] = q
+            if a.tier == "retailer":
+                pass
 
-        # 4) process orders and allocate shipments
+        # 4) Process orders and allocate
         self._process_orders_and_allocate(buyer_orders)
 
-        # 5) receive shipments và update cost
+        # 5) Receive shipments and fulfill demand
         for a in self.all_agents:
             a.step_receive()
 
-        # 6) production
+        # 6) Production (suppliers only)
         for a in self.all_agents:
             a.step_produce()
 
-        # 7) recovery countdown
+        # 7) Recovery countdown
         for a in self.all_agents:
             a.step_recover()
 
-        self.time += 1
+        # Track victim state
+        if self._victim is not None:
+            self.victim_history.append({
+                "step": self.time,
+                "inventory": self._victim.inventory,
+                "backlog": self._victim.backlog,
+                "capacity": self._victim.capacity,
+                "lead_time": self._victim.lead_time
+            })
 
+        self.time += 1
 
     # -----------------------------
     # Disruption handling
     # -----------------------------
     def _maybe_trigger_disruption(self):
         if (not self.disruption_done) and (self.time == self.disruption_at_step):
-            # choose victim among suppliers and plants
-            candidates = [a for a in self.all_agents if a.tier in ("supplier", "plant")]
+            # Select victim
+            if self.scenario == "capacity_loss":
+                candidates = [a for a in self.all_agents if a.tier in ("supplier", "plant")]
+            elif self.scenario == "demand_spike":
+                candidates = [a for a in self.all_agents if a.tier == "retailer"]
+            elif self.scenario == "lead_time_surge":
+                candidates = self.all_agents
+            else:
+                candidates = self.all_agents
+
             if not candidates:
                 return
+            
             victim = random.choice(candidates)
             self._victim = victim
-            self.fill_rate_before_disruption = self.compute_fill_rate()
-            # apply scenario
+            victim.is_disrupted = True
+
+            # Apply disruption
             if self.scenario == "capacity_loss":
-                # reduce capacity via ramp fraction
-                victim.recovery_ramp_fraction = max(0.0, 1.0 - self.capacity_loss_frac)
-                # set available capacity now accordingly
-                victim.available_capacity = int(victim.capacity * victim.recovery_ramp_fraction)
+                victim.capacity = max(1, int(victim.capacity * (1 - self.capacity_loss_frac)))
+                victim.available_capacity = victim.capacity
                 victim.recovery_timer = self.recovery_duration
+                
             elif self.scenario == "lead_time_surge":
-                victim.lead_time += 1
+                victim.lead_time += 4
                 victim.recovery_timer = self.recovery_duration
+                
             elif self.scenario == "demand_spike":
-                self.retailer_demand_mean = self._retailer_demand_baseline * 4.0
-                # model uses victim.recovery_timer as a system-level recovery window
+                self.retailer_demand_mean = self._retailer_demand_baseline * 4
                 victim.recovery_timer = self.recovery_duration
+
             self.disruption_done = True
             self.disruption_step = self.time
-            # print small log
-            print(f"[Disruption] t={self.time} scenario={self.scenario} victim={victim}")
+            
+            # Print disruption info
+            if self.scenario == "capacity_loss":
+                print(f"[Disruption] t={self.time} scenario={self.scenario} " +
+                      f"victim={victim.tier}-{victim.unique_id} " +
+                      f"(capacity: {victim._orig_capacity} -> {victim.capacity})")
+            elif self.scenario == "lead_time_surge":
+                print(f"[Disruption] t={self.time} scenario={self.scenario} " +
+                      f"victim={victim.tier}-{victim.unique_id} " +
+                      f"(lead_time: {victim._orig_lead_time} -> {victim.lead_time})")
+            elif self.scenario == "demand_spike":
+                print(f"[Disruption] t={self.time} scenario={self.scenario} " +
+                      f"victim={victim.tier}-{victim.unique_id} " +
+                      f"(demand: {self._retailer_demand_baseline:.1f} -> {self.retailer_demand_mean:.1f})")
 
     def _agent_recovered(self, agent):
-        """
-        Called when an agent finishes recovery (its recovery_timer reached zero).
-        Revert any temporary modifications (lead_time).
-        """
+        """Called when recovery_timer reaches zero."""
         if self._victim is None or agent.unique_id != self._victim.unique_id:
             return
-        if self._victim is not None and self._victim.recovery_timer == 0:
-         # reset demand baseline
-            if self.scenario == "demand_spike":
-                self.retailer_demand_mean = self._retailer_demand_baseline
-            agent.lead_time = agent._orig_lead_time
-            agent.available_capacity = agent._orig_capacity
+
+        # Revert ALL disruption effects
+        agent.lead_time = agent._orig_lead_time
+        agent.capacity = agent._orig_capacity
+        agent.available_capacity = agent.capacity
+
+        if self.scenario == "demand_spike":
+            self.retailer_demand_mean = self._retailer_demand_baseline
+
         self.recovery_step = self.time
+        
+        # Print recovery info
+        if self.scenario == "capacity_loss":
+            print(f"[Recovery] t={self.time} {agent.tier}-{agent.unique_id} " +
+                  f"restored (capacity: {agent.capacity})")
+        elif self.scenario == "lead_time_surge":
+            print(f"[Recovery] t={self.time} {agent.tier}-{agent.unique_id} " +
+                  f"restored (lead_time: {agent.lead_time})")
+        elif self.scenario == "demand_spike":
+            print(f"[Recovery] t={self.time} system-wide " +
+                  f"restored (demand: {self.retailer_demand_mean:.1f})")
 
     # -----------------------------
-    # Orders processing and allocation
+    # Order processing
     # -----------------------------
     def _process_orders_and_allocate(self, buyer_orders):
-        """
-        1) Map buyer orders to upstream suppliers (or external infinite source).
-        2) Create request buckets for all upstream nodes.
-        3) Suppliers allocate according to SRF (dynamic_reallocation) or proportional.
-        """
-        # prepare request buckets for all agent ids (safe)
+        # Request buckets
         request_buckets = {a.unique_id: [] for a in self.all_agents}
 
-        # map buyer orders to upstream nodes
+        demand_this_step = {a.unique_id: 0 for a in self.all_agents}
+
+        # Map orders to upstream
         for buyer_uid, qty in buyer_orders.items():
             if qty <= 0:
                 continue
             buyer = self._agent_by_uid(buyer_uid)
             preds = list(self.G.predecessors(buyer_uid))
+            
             if not preds:
-                # external infinite source: immediate shipment with buyer lead_time
+                # External infinite source
                 buyer.receive_shipment(qty, lead_time=buyer.lead_time, from_uid=None)
                 continue
-            # if single upstream or duals not enabled, send whole request to single predecessor
+            
+            # Single or dual sourcing
             if (len(preds) == 1) or (not self.strategy_dual):
-                # send full request to that one
                 supplier_uid = preds[0]
                 request_buckets[supplier_uid].append((buyer_uid, qty))
+                demand_this_step[supplier_uid] += qty
             else:
-                # dual sourcing: split according to dual_share across available preds (use first two)
-                # ensure ordering deterministic: sort preds
-                pids = preds[:2]
+                # Dual sourcing split
+                pids = sorted(preds)[:2]
                 s1_share, s2_share = self.dual_share
                 s1_qty = int(np.floor(qty * s1_share))
                 s2_qty = qty - s1_qty
                 request_buckets[pids[0]].append((buyer_uid, s1_qty))
                 request_buckets[pids[1]].append((buyer_uid, s2_qty))
+                demand_this_step[pids[0]] += s1_qty  
+                demand_this_step[pids[1]] += s2_qty
 
-        # now allocation from each upstream node's inventory
+        # Allocate from inventory
         for supplier_uid, reqs in request_buckets.items():
             if not reqs:
                 continue
             supplier = self._agent_by_uid(supplier_uid)
             total_req = sum(q for (_, q) in reqs)
+            
             if total_req <= supplier.inventory:
-                # satisfy all requests
+                # Fulfill all
                 for (buyer_uid, q) in reqs:
                     if q <= 0:
                         continue
@@ -291,9 +358,9 @@ class MultiTierModel(Model):
                     supplier.inventory -= q
                     buyer.receive_shipment(q, lead_time=supplier.lead_time, from_uid=supplier_uid)
             else:
-                # shortage: apply dynamic reallocation (SRF) or proportional allocation
+                # Shortage: apply allocation policy
                 if self.dynamic_reallocation:
-                    # sort by buyer backlog descending (service-recovery-first)
+                    # Service-recovery-first: prioritize high backlog
                     reqs_sorted = sorted(reqs, key=lambda x: self._agent_by_uid(x[0]).backlog, reverse=True)
                     remaining = supplier.inventory
                     for (buyer_uid, q) in reqs_sorted:
@@ -305,9 +372,8 @@ class MultiTierModel(Model):
                             supplier.inventory -= alloc
                             buyer.receive_shipment(alloc, lead_time=supplier.lead_time, from_uid=supplier_uid)
                             remaining -= alloc
-                    # remaining unmet requests produce backlog at buyers (retailers will have backlog already)
                 else:
-                    # proportional allocation based on requested share
+                    # Proportional allocation
                     remaining = supplier.inventory
                     for (buyer_uid, q) in reqs:
                         if remaining <= 0:
@@ -319,18 +385,13 @@ class MultiTierModel(Model):
                             supplier.inventory -= alloc
                             buyer.receive_shipment(alloc, lead_time=supplier.lead_time, from_uid=supplier_uid)
                             remaining -= alloc
-                    # allocate any leftover one-by-one
-                    if remaining > 0:
-                        for (buyer_uid, q) in reqs:
-                            if remaining <= 0:
-                                break
-                            buyer = self._agent_by_uid(buyer_uid)
-                            buyer.receive_shipment(1, lead_time=supplier.lead_time, from_uid=supplier_uid)
-                            supplier.inventory -= 1
-                            remaining -= 1
+
+        for uid, demand in demand_this_step.items():
+            agent = self._agent_by_uid(uid)
+            if agent:
+                agent.record_demand_received(demand)
 
     def _agent_by_uid(self, uid):
-        # small network: linear search OK; can optimize with dict if needed
         for a in self.all_agents:
             if a.unique_id == uid:
                 return a
@@ -342,42 +403,137 @@ class MultiTierModel(Model):
     def compute_fill_rate(self):
         total_demand = sum(r.total_demand for r in self.retailers)
         total_fulfilled = sum(r.fulfilled_demand for r in self.retailers)
-        return total_fulfilled / total_demand if total_demand > 0 else np.nan
+        return total_fulfilled / total_demand if total_demand > 0 else 1.0
 
     def compute_total_cost(self):
         return sum(a.holding_cost + a.backlog_cost for a in self.all_agents)
 
-    def compute_bullwhip(self):
-        retailer_orders = [x for r in self.retailers for x in r.order_history]
-        upstream_orders = [x for a in self.all_agents if a.tier in ("supplier", "plant") for x in a.order_history]
-        if len(retailer_orders) < 2 or np.var(retailer_orders) == 0:
-            return np.nan
-        return float(np.var(upstream_orders) / np.var(retailer_orders)) if np.var(retailer_orders) > 0 else np.nan
+    def compute_bullwhip(self, debug=False):
+        """
+        Tính Bullwhip ratio ĐÚNG CÁCH:
+        Tại mỗi tier: Var(orders đặt ra) / Var(demand nhận vào)
+        
+        Returns: Dictionary với bullwhip ratio của từng tier và total
+        """
+        bullwhip_ratios = {}
+        
+        min_samples = 10  # Cần ít nhất 10 samples để tính variance có ý nghĩa
+        
+        # 1. RETAILER: Var(orders đặt cho DC) / Var(customer demand)
+        retailer_orders = []
+        retailer_demand = []
+        for r in self.retailers:
+            retailer_orders.extend(r.order_history)
+            retailer_demand.extend(r.demand_received_history)
+        
+        if len(retailer_orders) >= min_samples and len(retailer_demand) >= min_samples:
+            var_orders = np.var(retailer_orders)
+            var_demand = np.var(retailer_demand)
+            bullwhip_ratios["retailer"] = var_orders / var_demand if var_demand > 0.1 else 1.0
+        else:
+            bullwhip_ratios["retailer"] = np.nan
+        
+        # 2. DC: Var(orders đặt cho Plant) / Var(demand từ Retailers)
+        dc_orders = []
+        dc_demand = []
+        for dc in self.dcs:
+            dc_orders.extend(dc.order_history)
+            dc_demand.extend(dc.demand_received_history)
+        
+        if len(dc_orders) >= min_samples and len(dc_demand) >= min_samples:
+            var_orders = np.var(dc_orders)
+            var_demand = np.var(dc_demand)
+            bullwhip_ratios["dc"] = var_orders / var_demand if var_demand > 0.1 else 1.0
+        else:
+            bullwhip_ratios["dc"] = np.nan
+        
+        # 3. PLANT: Var(orders đặt cho Supplier) / Var(demand từ DCs)
+        plant_orders = []
+        plant_demand = []
+        for p in self.plants:
+            plant_orders.extend(p.order_history)
+            plant_demand.extend(p.demand_received_history)
+        
+        if len(plant_orders) >= min_samples and len(plant_demand) >= min_samples:
+            var_orders = np.var(plant_orders)
+            var_demand = np.var(plant_demand)
+            bullwhip_ratios["plant"] = var_orders / var_demand if var_demand > 0.1 else 1.0
+        else:
+            bullwhip_ratios["plant"] = np.nan
+        
+        # 4. SUPPLIER: Var(production/orders) / Var(demand từ Plants)
+        supplier_orders = []
+        supplier_demand = []
+        for s in self.suppliers:
+            supplier_orders.extend(s.order_history)
+            supplier_demand.extend(s.demand_received_history)
+        
+        if len(supplier_orders) >= min_samples and len(supplier_demand) >= min_samples:
+            var_orders = np.var(supplier_orders)
+            var_demand = np.var(supplier_demand)
+            bullwhip_ratios["supplier"] = var_orders / var_demand if var_demand > 0.1 else 1.0
+        else:
+            bullwhip_ratios["supplier"] = np.nan
+        
+        # 5. TOTAL CHAIN: Product của tất cả ratios (hoặc end-to-end ratio)
+        valid_ratios = [v for v in bullwhip_ratios.values() if not np.isnan(v)]
+        if valid_ratios:
+            bullwhip_ratios["total"] = np.prod(valid_ratios)
+        else:
+            bullwhip_ratios["total"] = np.nan
+        
+        # Debug output
+        if debug:
+            print(f"  [Bullwhip by Tier]")
+            for tier, ratio in bullwhip_ratios.items():
+                print(f"    {tier:10s}: {ratio:.2f}" if not np.isnan(ratio) else f"    {tier:10s}: N/A")
+        
+        return bullwhip_ratios
 
     def compute_backlog_duration(self):
-        """
-        Average backlog duration across retailers (number of steps with backlog>0).
-        """
-        durations = [sum(r.backlog_history) for r in self.retailers]
+        """Average backlog duration across retailers post-disruption."""
+        if self.disruption_step is None:
+            return np.nan
+        
+        durations = []
+        for r in self.retailers:
+            hist = r.backlog_history[self.disruption_step:]
+            dur = sum(1 for x in hist if x > 0)
+            durations.append(dur)
+        
         return float(np.mean(durations)) if durations else np.nan
 
-    def compute_time_to_recover(self, target_frac=0.95):
-        """
-        TTR = steps until fill_rate >= target_frac * fill_rate avg in first 10 steps.
-        """
+    def compute_time_to_recover(self, target_frac=0.90):  # Lower threshold
         if not self.disruption_done or self.disruption_step is None:
             return np.nan
-
-        baseline = getattr(self, "fill_rate_baseline", None)
-        if baseline is None or np.isnan(baseline):
-            return np.nan
-
+        
         df = self.datacollector.get_model_vars_dataframe()
+        
+        # Use fill_rate at disruption step as reference
+        if self.disruption_step in df.index:
+            pre_disruption = df[df.index < self.disruption_step]
+            if len(pre_disruption) >= 3:
+                baseline = pre_disruption["fill_rate"].tail(3).mean()
+            else:
+                baseline = 0.95
+        else:
+            baseline = 0.95
+        
         target = target_frac * baseline
-
-        recovery_steps = df.index[(df["fill_rate"] >= target) & (df.index >= self.disruption_step)].tolist()
+        
+        # Find MINIMUM fill rate after disruption
+        post_disruption = df[df.index > self.disruption_step]
+        if len(post_disruption) == 0:
+            return np.nan
+        
+        min_fill_idx = post_disruption["fill_rate"].idxmin()
+        
+        # Search for recovery AFTER the minimum
+        recovery_search = post_disruption[post_disruption.index >= min_fill_idx]
+        recovery_steps = recovery_search[recovery_search["fill_rate"] >= target].index.tolist()
+        
         if recovery_steps:
-            return int(recovery_steps[0] - self.disruption_step + 1)
-        return np.nan
-
-
+            ttr = int(recovery_steps[0] - self.disruption_step)
+            return max(1, ttr)
+        
+        return float(len(post_disruption))
