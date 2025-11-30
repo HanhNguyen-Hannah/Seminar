@@ -236,7 +236,7 @@ class MultiTierModel(Model):
             elif self.scenario == "demand_spike":
                 candidates = [a for a in self.all_agents if a.tier == "retailer"]
             elif self.scenario == "lead_time_surge":
-                candidates = [a for a in self.all_agents if a.tier in ("supplier", "plant", "dc")]
+                candidates = [a for a in self.all_agents if a.tier in ("plant", "dc")] #Supplier include or not ??
             else:
                 candidates = self.all_agents
 
@@ -260,7 +260,7 @@ class MultiTierModel(Model):
                 
                 for agent in self._affected_agents:
                     agent._orig_lead_time = agent.lead_time
-                    agent.lead_time += 3
+                    agent.lead_time += 8
                     agent.is_disrupted = True
                     agent.recovery_timer = self.recovery_duration
                 
@@ -283,7 +283,7 @@ class MultiTierModel(Model):
             elif self.scenario == "lead_time_surge":
                 print(f"[Disruption] t={self.time} scenario={self.scenario} " +
                     f"affected_tier={affected_tier} " +
-                    f"(all {len(self._affected_agents)} {affected_tier}s: lead_time +3)")
+                    f"(all {len(self._affected_agents)} {affected_tier}s: lead_time +8)")
             elif self.scenario == "demand_spike":
                 print(f"[Disruption] t={self.time} scenario={self.scenario} " +
                     f"(all {len(self.retailers)} retailers: demand x5)")

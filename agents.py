@@ -1,4 +1,4 @@
-# agents.py - FIXED VERSION WITH IMPROVEMENTS
+# agents.py
 from mesa import Agent
 import numpy as np
 
