@@ -161,10 +161,9 @@ class BaseFirm(Agent):
 
     def step_produce(self):
         """
-        Only SUPPLIERS produce from raw materials.
-        Plants transform via order-receive-ship cycle (no explicit production).
+        Only SUPPLIERS and PLANT produce from raw materials.
         """
-        if self.tier == "supplier" and self.available_capacity > 0:
+        if self.tier in ("supplier", "plant") and self.available_capacity > 0:
             pipeline = sum(e["qty"] for e in self.in_transit)
             net_inv = self.inventory + pipeline - self.backlog
             desired = max(0, int(self.base_stock - net_inv))

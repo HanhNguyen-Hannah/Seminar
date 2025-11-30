@@ -53,10 +53,9 @@ class MultiTierModel(Model):
 
         # Strategies
         self.strategy_dual = strategies.get("dual_sourcing", False)
-        self.safety_stock_factor = strategies.get("safety_stock_factor", 1.0)
+        self.safety_stock_factor = strategies.get("safety_stock_factor", 1.2)
         self.flexible_capacity = strategies.get("flexible_capacity", False)
         self.dynamic_reallocation = strategies.get("dynamic_reallocation", False)
-        self.dual_share = strategies.get("dual_share", (0.8, 0.2))
 
         # Disruption config
         self.disruption_at_step = disruption_at_step
@@ -142,9 +141,9 @@ class MultiTierModel(Model):
     def _build_network(self):
         """
         Build deterministic network topology using round-robin assignment.
-        Ensures all suppliers are utilized.
+        Ensures all nodes at every tier are connected.
         """
-        # Supplier -> Plant
+        # Supplier -> Plant: Loop plants
         for i, plant in enumerate(self.plants):
             if self.strategy_dual and len(self.suppliers) >= 2:
                 # Dual sourcing: assign 2 suppliers per plant
@@ -157,12 +156,12 @@ class MultiTierModel(Model):
                 s = self.suppliers[i % len(self.suppliers)]
                 self.G.add_edge(s.unique_id, plant.unique_id)
         
-        # Plant -> DC
-        for i, dc in enumerate(self.dcs):
-            p = self.plants[i % len(self.plants)]
-            self.G.add_edge(p.unique_id, dc.unique_id)
+        # Plant -> DC: Loop plants
+        for i, plant in enumerate(self.plants):
+            dc = self.dcs[i % len(self.dcs)]
+            self.G.add_edge(plant.unique_id, dc.unique_id)
         
-        # DC -> Retailer
+        # DC -> Retailer: Loop retailers
         for i, r in enumerate(self.retailers):
             dc = self.dcs[i % len(self.dcs)]
             self.G.add_edge(dc.unique_id, r.unique_id)
@@ -231,13 +230,13 @@ class MultiTierModel(Model):
     # -----------------------------
     def _maybe_trigger_disruption(self):
         if (not self.disruption_done) and (self.time == self.disruption_at_step):
-            # Select victim
+            # Select victim based on scenario
             if self.scenario == "capacity_loss":
                 candidates = [a for a in self.all_agents if a.tier in ("supplier", "plant")]
             elif self.scenario == "demand_spike":
                 candidates = [a for a in self.all_agents if a.tier == "retailer"]
             elif self.scenario == "lead_time_surge":
-                candidates = self.all_agents
+                candidates = [a for a in self.all_agents if a.tier in ("supplier", "plant", "dc")]
             else:
                 candidates = self.all_agents
 
@@ -246,21 +245,32 @@ class MultiTierModel(Model):
             
             victim = random.choice(candidates)
             self._victim = victim
-            victim.is_disrupted = True
 
             # Apply disruption
             if self.scenario == "capacity_loss":
+                victim.is_disrupted = True
                 victim.capacity = max(1, int(victim.capacity * (1 - self.capacity_loss_frac)))
                 victim.available_capacity = victim.capacity
                 victim.recovery_timer = self.recovery_duration
                 
             elif self.scenario == "lead_time_surge":
-                victim.lead_time += 4
-                victim.recovery_timer = self.recovery_duration
+                # Affect entire tier
+                affected_tier = victim.tier
+                self._affected_agents = [a for a in self.all_agents if a.tier == affected_tier]
+                
+                for agent in self._affected_agents:
+                    agent._orig_lead_time = agent.lead_time
+                    agent.lead_time += 3
+                    agent.is_disrupted = True
+                    agent.recovery_timer = self.recovery_duration
                 
             elif self.scenario == "demand_spike":
-                self.retailer_demand_mean = self._retailer_demand_baseline * 4
-                victim.recovery_timer = self.recovery_duration
+                # Affect all retailers
+                self.retailer_demand_mean = self._retailer_demand_baseline * 5
+                
+                for r in self.retailers:
+                    r.is_disrupted = True
+                    r.recovery_timer = self.recovery_duration
 
             self.disruption_done = True
             self.disruption_step = self.time
@@ -268,42 +278,42 @@ class MultiTierModel(Model):
             # Print disruption info
             if self.scenario == "capacity_loss":
                 print(f"[Disruption] t={self.time} scenario={self.scenario} " +
-                      f"victim={victim.tier}-{victim.unique_id} " +
-                      f"(capacity: {victim._orig_capacity} -> {victim.capacity})")
+                    f"victim={victim.tier}-{victim.unique_id} " +
+                    f"(capacity: {victim._orig_capacity} -> {victim.capacity})")
             elif self.scenario == "lead_time_surge":
                 print(f"[Disruption] t={self.time} scenario={self.scenario} " +
-                      f"victim={victim.tier}-{victim.unique_id} " +
-                      f"(lead_time: {victim._orig_lead_time} -> {victim.lead_time})")
+                    f"affected_tier={affected_tier} " +
+                    f"(all {len(self._affected_agents)} {affected_tier}s: lead_time +3)")
             elif self.scenario == "demand_spike":
                 print(f"[Disruption] t={self.time} scenario={self.scenario} " +
-                      f"victim={victim.tier}-{victim.unique_id} " +
-                      f"(demand: {self._retailer_demand_baseline:.1f} -> {self.retailer_demand_mean:.1f})")
+                    f"(all {len(self.retailers)} retailers: demand x5)")
 
     def _agent_recovered(self, agent):
         """Called when recovery_timer reaches zero."""
-        if self._victim is None or agent.unique_id != self._victim.unique_id:
-            return
-
-        # Revert ALL disruption effects
+        
+        # Revert disruption effects
         agent.lead_time = agent._orig_lead_time
         agent.capacity = agent._orig_capacity
         agent.available_capacity = agent.capacity
+        agent.is_disrupted = False
 
-        if self.scenario == "demand_spike":
+        # For demand_spike, restore demand when first retailer recovers
+        if self.scenario == "demand_spike" and self.recovery_step is None:
             self.retailer_demand_mean = self._retailer_demand_baseline
 
-        self.recovery_step = self.time
-        
-        # Print recovery info
-        if self.scenario == "capacity_loss":
-            print(f"[Recovery] t={self.time} {agent.tier}-{agent.unique_id} " +
-                  f"restored (capacity: {agent.capacity})")
-        elif self.scenario == "lead_time_surge":
-            print(f"[Recovery] t={self.time} {agent.tier}-{agent.unique_id} " +
-                  f"restored (lead_time: {agent.lead_time})")
-        elif self.scenario == "demand_spike":
-            print(f"[Recovery] t={self.time} system-wide " +
-                  f"restored (demand: {self.retailer_demand_mean:.1f})")
+        # Log recovery once (first agent to recover)
+        if self.recovery_step is None:
+            self.recovery_step = self.time
+            
+            if self.scenario == "capacity_loss":
+                print(f"[Recovery] t={self.time} {agent.tier}-{agent.unique_id} " +
+                    f"restored (capacity: {agent.capacity})")
+            elif self.scenario == "lead_time_surge":
+                print(f"[Recovery] t={self.time} {agent.tier} tier " +
+                    f"restored (lead_time back to normal)")
+            elif self.scenario == "demand_spike":
+                print(f"[Recovery] t={self.time} all retailers " +
+                    f"restored (demand: {self.retailer_demand_mean:.1f})")
 
     # -----------------------------
     # Order processing
@@ -332,15 +342,28 @@ class MultiTierModel(Model):
                 request_buckets[supplier_uid].append((buyer_uid, qty))
                 demand_this_step[supplier_uid] += qty
             else:
-                # Dual sourcing split
+                # Dual sourcing backup: primary first, overflow to secondary
                 pids = sorted(preds)[:2]
-                s1_share, s2_share = self.dual_share
-                s1_qty = int(np.floor(qty * s1_share))
-                s2_qty = qty - s1_qty
-                request_buckets[pids[0]].append((buyer_uid, s1_qty))
-                request_buckets[pids[1]].append((buyer_uid, s2_qty))
-                demand_this_step[pids[0]] += s1_qty  
-                demand_this_step[pids[1]] += s2_qty
+                primary_uid = pids[0]
+                secondary_uid = pids[1]
+                
+                primary_supplier = self._agent_by_uid(primary_uid)
+                primary_available = primary_supplier.inventory
+                
+                if primary_available >= qty:
+                    # Primary đủ hàng → order hết từ primary
+                    request_buckets[primary_uid].append((buyer_uid, qty))
+                    demand_this_step[primary_uid] += qty
+                else:
+                    # Primary không đủ → lấy hết từ primary, còn lại từ secondary
+                    from_primary = primary_available
+                    from_secondary = qty - from_primary
+                    if from_primary > 0:
+                        request_buckets[primary_uid].append((buyer_uid, from_primary))
+                        demand_this_step[primary_uid] += from_primary
+                    if from_secondary > 0:
+                        request_buckets[secondary_uid].append((buyer_uid, from_secondary))
+                        demand_this_step[secondary_uid] += from_secondary
 
         # Allocate from inventory
         for supplier_uid, reqs in request_buckets.items():
