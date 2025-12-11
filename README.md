@@ -1,5 +1,8 @@
-# Supply Chain Resilience under Disruptions
-## An Agent-Based Simulation with Mesa
+# Supply Chain Resilience under Disruptions - An Agent-Based Simulation with Mesa
+
+Seminar project
+The Faculty of Business Management and Economics
+Universität Würzburg
 
 This project implements a multi-tier supply chain agent-based model (ABM) to study resilience strategies under various disruption scenarios.
 
