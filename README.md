@@ -2,7 +2,7 @@
 
 | Universität Würzburg
 | The Faculty of Business Management and Economics
-| Hanh Nguyen Nguyen |
+| Hanh Nguyen Nguyen
 
 This project implements a multi-tier supply chain agent-based model (ABM) to study resilience strategies under various disruption scenarios.
 
