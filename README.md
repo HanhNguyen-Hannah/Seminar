@@ -1,10 +1,8 @@
 # Supply Chain Resilience under Disruptions - An Agent-Based Simulation with Mesa
 
-Seminar project
-
-The Faculty of Business Management and Economics
-
-Universität Würzburg
+| Universität Würzburg
+| The Faculty of Business Management and Economics
+| Hanh Nguyen Nguyen |
 
 This project implements a multi-tier supply chain agent-based model (ABM) to study resilience strategies under various disruption scenarios.
 
@@ -16,6 +14,7 @@ This project implements a multi-tier supply chain agent-based model (ABM) to stu
 ├── run.py                    # Experiment runner and data export
 ├── merge.ipynb               # Merge results from multiple seeds
 ├── generate_figures.ipynb    # Generate publication-quality figures
+├── sensitivity.py            # Sensitivity analysis script
 ├── output_data_[seed]/       # Output folders per seed
 │   ├── timeseries_all.csv
 │   ├── agent_data.csv
@@ -27,6 +26,10 @@ This project implements a multi-tier supply chain agent-based model (ABM) to stu
 │   ├── agent_data.csv
 │   ├── summary_raw.csv
 │   └── summary_aggregated.csv
+├── sensitivity_results/      # Sensitivity analysis outputs
+│   ├── sensitivity_raw.csv
+│   ├── sensitivity_fill_rate.png/pdf
+│   └── sensitivity_cost.png/pdf
 └── figures/                  # Generated figures for paper/presentation
     ├── fig1_timeseries.png/pdf
     ├── fig2_ttr_by_scenario.png/pdf
@@ -125,6 +128,24 @@ Run `generate_figures.ipynb` to create publication-quality figures:
 # - LaTeX tables (tables.tex)
 ```
 
+### Step 4: Sensitivity Analysis
+
+Run `sensitivity.py` to analyze parameter sensitivity:
+
+```bash
+python sensitivity.py
+```
+
+This tests model robustness across three parameters:
+- **Demand Spike Factor**: 2×, 3×, 5×, 7× demand multiplier
+- **Lead Time Increase**: +4, +8, +12, +16 periods
+- **Recovery Duration**: 3, 5, 7, 10 periods
+
+Outputs to `sensitivity_results/`:
+- `sensitivity_raw.csv` - Raw results
+- `sensitivity_fill_rate.png/pdf` - Fill rate sensitivity (3-panel figure)
+- `sensitivity_cost.png/pdf` - Total cost sensitivity (3-panel figure)
+
 ## Default Parameters
 
 ```python
@@ -175,6 +196,14 @@ pip install mesa networkx numpy pandas matplotlib seaborn
 ### Merged outputs (`output_final/`)
 
 Combined data from all seeds for statistical analysis.
+
+### Sensitivity outputs (`sensitivity_results/`)
+
+| File | Description |
+|------|-------------|
+| `sensitivity_raw.csv` | Parameter sweep results (72 experiments) |
+| `sensitivity_fill_rate.png/pdf` | Fill rate vs parameters (3-panel) |
+| `sensitivity_cost.png/pdf` | Total cost vs parameters (3-panel) |
 
 ### Figures (`figures/`)
 
